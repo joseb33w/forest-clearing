@@ -8,8 +8,8 @@ const WALK_SPEED := 3.2
 const LOOK_SENS := 0.005
 const GRAVITY := 22.0
 const JUMP_SPEED := 8.5
-const STEP_MAX := 1.2
-const CAM_DIST := 6.5
+const STEP_MAX := 0.5   # low lips only — 1.2 let the player climb ONTO the campfire
+const CAM_DIST := 7.5
 const CAM_PITCH_MIN := -1.25
 const CAM_PITCH_MAX := 0.6
 
@@ -31,11 +31,13 @@ var chest_node: Node3D
 var _cur_clip := ""
 var _was_airborne := false
 var _js_set_time_cb = null
-var _js_get_player_cb = null
-var _js_solids_cb = null
 var _yaw := 0.0
 var _pitch := -0.42
-var _jump_queued := false
+var _jump_buffer := 0.0   # seconds left to honor a queued jump (input buffering)
+var _jump_btn: Button
+var _stick_base: Panel
+var _stick_knob: Panel
+var _mirror_tick := 0
 
 var _move_index := -1
 var _move_origin := Vector2.ZERO
@@ -45,10 +47,19 @@ var _look_index := -1
 
 func _ready() -> void:
 	get_viewport().msaa_3d = Viewport.MSAA_2X
+	_apply_content_scale()
+	get_window().size_changed.connect(_apply_content_scale)
 	_build_world()
 	_setup_web_time_hooks()
 	_build_touch_ui()
 	_show_tap_to_start()
+
+
+## Keep UI at a readable scale in BOTH orientations: the base viewport is portrait
+## 720x1280, which shrinks all UI to ~30% in landscape unless the base is swapped.
+func _apply_content_scale() -> void:
+	var s: Vector2i = get_window().size
+	get_window().content_scale_size = Vector2i(720, 1280) if s.x < s.y else Vector2i(1280, 720)
 
 
 func _physics_process(delta: float) -> void:
@@ -60,23 +71,25 @@ func _physics_process(delta: float) -> void:
 	if chest_found:
 		v = Vector2.ZERO
 	var dir := Basis(Vector3.UP, _yaw) * Vector3(v.x, 0.0, v.y)
-	var spd := MOVE_SPEED if v.length() > 0.6 else WALK_SPEED
+	var spd := lerpf(WALK_SPEED, MOVE_SPEED, smoothstep(0.35, 0.9, v.length()))
 	player.velocity.x = dir.x * spd
 	player.velocity.z = dir.z * spd
 	if not player.is_on_floor():
 		player.velocity.y -= GRAVITY * delta
-	elif _jump_queued:
+	elif _jump_buffer > 0.0:
 		player.velocity.y = JUMP_SPEED
+		_jump_buffer = 0.0
 		AudioManager.play_sfx("ui", -8.0, 1.3)
 	else:
 		player.velocity.y = -1.0
-	_jump_queued = false
+	_jump_buffer = maxf(0.0, _jump_buffer - delta)
 	player.move_and_slide()
 	_step_up_assist(dir)
 	player.rotation.y = _yaw
 	if cam_spring:
 		cam_spring.rotation.x = _pitch
 	_update_hero(dir, v.length(), delta)
+	_mirror_state_to_js()
 
 
 ## Face the model along the move direction and drive idle/walk/run clips.
@@ -158,26 +171,31 @@ func _input(event: InputEvent) -> void:
 	if not started:
 		return
 	if event is InputEventKey and event.pressed and not event.echo and (event as InputEventKey).keycode == KEY_SPACE:
-		_jump_queued = true
+		_jump_buffer = 0.12
 		return
 	var half := get_viewport().get_visible_rect().size.x * 0.5
 	if event is InputEventScreenTouch:
 		if event.pressed:
+			if _jump_btn != null and _jump_btn.get_global_rect().has_point(event.position):
+				return   # the button owns this touch — don't claim it for look/move
 			if event.position.x < half and _move_index == -1:
 				_move_index = event.index
 				_move_origin = event.position
 				_move_vec = Vector2.ZERO
+				_show_stick(event.position)
 			elif event.position.x >= half and _look_index == -1:
 				_look_index = event.index
 		else:
 			if event.index == _move_index:
 				_move_index = -1
 				_move_vec = Vector2.ZERO
+				_hide_stick()
 			elif event.index == _look_index:
 				_look_index = -1
 	elif event is InputEventScreenDrag:
 		if event.index == _move_index:
 			_move_vec = ((event.position - _move_origin) / 80.0).limit_length(1.0)
+			_move_stick(_move_vec)
 		elif event.index == _look_index:
 			_apply_look(event.relative)
 	elif event is InputEventMouseMotion and (event.button_mask & MOUSE_BUTTON_MASK_LEFT) != 0 and _move_index == -1 and _look_index == -1:
@@ -223,7 +241,7 @@ func _build_world() -> void:
 	_build_boundary()
 
 	# The cabin — the clearing's landmark, in clear sight of spawn.
-	var cabin := _place("res://models/building_home_A_red.glb", CABIN_POS, {"footprint": 7.0, "yaw": 180.0, "collider": "box"})
+	var cabin := _place("res://models/building_home_A_red.glb", CABIN_POS, {"footprint": 7.0, "yaw": 0.0, "collider": "box"})
 	if cabin == null:
 		push_warning("cabin failed to load")
 
@@ -240,7 +258,7 @@ func _build_world() -> void:
 func _build_ground() -> void:
 	var ground := MeshInstance3D.new()
 	var plane := PlaneMesh.new()
-	plane.size = Vector2(48.0, 48.0)
+	plane.size = Vector2(56.0, 56.0)
 	ground.mesh = plane
 	ground.material_override = ground_material("grass")
 	var gbody := StaticBody3D.new()
@@ -248,7 +266,7 @@ func _build_ground() -> void:
 	gbody.add_to_group("gogi_terrain")
 	var gcs := CollisionShape3D.new()
 	var gshape := BoxShape3D.new()
-	gshape.size = Vector3(48.0, 0.2, 48.0)
+	gshape.size = Vector3(56.0, 0.2, 56.0)
 	gcs.shape = gshape
 	gcs.position.y = -0.1
 	gbody.add_child(gcs)
@@ -267,7 +285,7 @@ func _build_boundary() -> void:
 	]
 	for s: Array in specs:
 		var body := StaticBody3D.new()
-		body.collision_layer = 1
+		body.collision_layer = 128   # boundary-only layer: blocks the player, NOT the camera arm
 		var cs := CollisionShape3D.new()
 		var box := BoxShape3D.new()
 		box.size = s[1]
@@ -418,18 +436,18 @@ func _build_flora_and_rocks() -> void:
 	_place("res://models/Rock_1.glb", Vector3(-6.9, 0, -9.2), {"footprint": 0.8})
 	_place("res://models/Rock_2.glb", Vector3(-15, 0, 15), {"footprint": 1.4, "collider": "box"})
 	# The treeline that encloses the clearing (MultiMesh — one draw call per mesh).
-	_scatter_ring("res://models/PineTree_1.glb", 34, CLEARING_R + 1.5, CLEARING_R + 6.0, 0.9, 1.5)
-	_scatter_ring("res://models/PineTree_2.glb", 28, CLEARING_R + 1.0, CLEARING_R + 5.5, 0.85, 1.4)
-	_scatter_ring("res://models/CommonTree_1.glb", 20, CLEARING_R + 1.2, CLEARING_R + 5.0, 0.8, 1.3)
+	_scatter_ring("res://models/PineTree_1.glb", 34, CLEARING_R + 1.5, CLEARING_R + 5.5, 0.9, 1.4, 9.0)
+	_scatter_ring("res://models/PineTree_2.glb", 28, CLEARING_R + 1.0, CLEARING_R + 5.5, 0.85, 1.3, 9.5)
+	_scatter_ring("res://models/CommonTree_1.glb", 20, CLEARING_R + 1.2, CLEARING_R + 5.0, 0.8, 1.2, 7.5)
 	# Ground dressing: grass tufts + flowers, keeping the pond + cabin clear.
-	_scatter_disc("res://models/Grass_Wispy_Tall.glb", 170, 17.5, 0.8, 1.5)
-	_scatter_disc("res://models/Flower_3_Single.glb", 46, 16.5, 0.9, 1.4)
+	_scatter_disc("res://models/Grass_Wispy_Tall.glb", 170, 17.5, 0.8, 1.4, 0.45)
+	_scatter_disc("res://models/Flower_3_Single.glb", 46, 16.5, 0.9, 1.3, 0.55)
 
 
 func _build_player() -> void:
 	player = CharacterBody3D.new()
 	player.collision_layer = 2
-	player.collision_mask = 1
+	player.collision_mask = 1 | 128   # world + boundary walls
 	player.floor_max_angle = deg_to_rad(55)
 	player.position = Vector3(0.0, 0.0, 10.0)
 	add_child(player)
@@ -465,13 +483,14 @@ func _build_player() -> void:
 
 	cam_spring = SpringArm3D.new()
 	cam_spring.spring_length = CAM_DIST
-	cam_spring.collision_mask = 1
+	cam_spring.collision_mask = 1 | 32768   # world + camera-only canopy shapes; ignores boundary walls
 	cam_spring.margin = 0.3
-	cam_spring.position.y = 1.4
+	cam_spring.position.y = 1.55
 	cam_spring.rotation.x = _pitch
 	player.add_child(cam_spring)
 	camera = Camera3D.new()
 	camera.fov = 62.0
+	camera.position.z = CAM_DIST   # resting pose for the title gate (the arm can't extend while paused)
 	cam_spring.add_child(camera)
 
 
@@ -563,7 +582,7 @@ func _show_win_panel() -> void:
 	var btn := Button.new()
 	btn.text = "Play Again"
 	btn.add_theme_font_size_override("font_size", 30)
-	btn.custom_minimum_size = Vector2(240, 76)
+	btn.custom_minimum_size = Vector2(240, 90)
 	btn.pressed.connect(func() -> void:
 		AudioManager.play_sfx("ui")
 		get_tree().reload_current_scene())
@@ -573,6 +592,7 @@ func _show_win_panel() -> void:
 	layer.add_child(box)
 	add_child(layer)
 	box.scale = Vector2(0.7, 0.7)
+	await get_tree().process_frame   # size is 0 until layout — pivot must wait
 	box.pivot_offset = box.size * 0.5
 	var t := box.create_tween()
 	t.tween_property(box, "scale", Vector2.ONE, 0.25).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
@@ -587,6 +607,7 @@ func _build_touch_ui() -> void:
 	var jbtn := Button.new()
 	jbtn.text = "JUMP"
 	jbtn.custom_minimum_size = Vector2(110, 110)
+	jbtn.action_mode = BaseButton.ACTION_MODE_BUTTON_PRESS   # jump on touch-down, not release
 	jbtn.anchor_left = 1.0
 	jbtn.anchor_right = 1.0
 	jbtn.anchor_top = 1.0
@@ -595,8 +616,51 @@ func _build_touch_ui() -> void:
 	jbtn.offset_right = -30.0
 	jbtn.offset_top = -150.0
 	jbtn.offset_bottom = -40.0
-	jbtn.pressed.connect(func() -> void: _jump_queued = true)
+	jbtn.pressed.connect(func() -> void: _jump_buffer = 0.12)
 	layer.add_child(jbtn)
+	_jump_btn = jbtn
+	_stick_base = _make_circle(120.0, Color(1, 1, 1, 0.14))
+	_stick_knob = _make_circle(52.0, Color(1, 1, 1, 0.30))
+	layer.add_child(_stick_base)
+	layer.add_child(_stick_knob)
+
+
+func _make_circle(diam: float, color: Color) -> Panel:
+	var p := Panel.new()
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = color
+	var r := int(diam * 0.5)
+	sb.corner_radius_top_left = r
+	sb.corner_radius_top_right = r
+	sb.corner_radius_bottom_left = r
+	sb.corner_radius_bottom_right = r
+	p.add_theme_stylebox_override("panel", sb)
+	p.size = Vector2(diam, diam)
+	p.visible = false
+	p.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	return p
+
+
+func _show_stick(at: Vector2) -> void:
+	if _stick_base == null:
+		return
+	_stick_base.position = at - _stick_base.size * 0.5
+	_stick_knob.position = at - _stick_knob.size * 0.5
+	_stick_base.visible = true
+	_stick_knob.visible = true
+
+
+func _move_stick(vec: Vector2) -> void:
+	if _stick_knob == null or not _stick_knob.visible:
+		return
+	_stick_knob.position = _move_origin + vec * 44.0 - _stick_knob.size * 0.5
+
+
+func _hide_stick() -> void:
+	if _stick_base == null:
+		return
+	_stick_base.visible = false
+	_stick_knob.visible = false
 
 
 func _show_objective_toast() -> void:
@@ -720,6 +784,17 @@ func _add_collider(model: Node3D, kind: String) -> void:
 		cyl.height = minf(aabb.size.y, 4.0)
 		cs.shape = cyl
 		cs.position = Vector3(model.global_position.x, aabb.position.y + cyl.height * 0.5, model.global_position.z)
+		# Camera-only canopy blocker (layer 16 / bit 32768): the SpringArm clamps at the
+		# foliage instead of burying the view inside it; movement ignores this shape.
+		var cam_body := StaticBody3D.new()
+		cam_body.collision_layer = 32768
+		var ccs := CollisionShape3D.new()
+		var sph := SphereShape3D.new()
+		sph.radius = maxf(aabb.size.x, aabb.size.z) * 0.42
+		ccs.shape = sph
+		ccs.position = Vector3(model.global_position.x, aabb.position.y + aabb.size.y * 0.68, model.global_position.z)
+		cam_body.add_child(ccs)
+		add_child(cam_body)
 	else:
 		var box := BoxShape3D.new()
 		box.size = aabb.size
@@ -730,7 +805,8 @@ func _add_collider(model: Node3D, kind: String) -> void:
 
 
 ## Scatter one .glb as MultiMesh instances in a ring around the origin (treeline).
-func _scatter_ring(path: String, count: int, r_min: float, r_max: float, s_min: float, s_max: float) -> void:
+## `base_h` normalizes the model to that height in metres before the s_min..s_max jitter.
+func _scatter_ring(path: String, count: int, r_min: float, r_max: float, s_min: float, s_max: float, base_h: float) -> void:
 	var xforms: Array = []
 	var rng := RandomNumberGenerator.new()
 	rng.seed = hash(path) + count
@@ -741,11 +817,11 @@ func _scatter_ring(path: String, count: int, r_min: float, r_max: float, s_min: 
 			Basis(Vector3.UP, rng.randf() * TAU).scaled(Vector3.ONE * rng.randf_range(s_min, s_max)),
 			Vector3(cos(a) * rad, 0, sin(a) * rad))
 		xforms.append(t)
-	_multimesh_from_glb(path, xforms)
+	_multimesh_from_glb(path, xforms, base_h)
 
 
-## Scatter inside a disc, avoiding the pond, cabin and campfire spots.
-func _scatter_disc(path: String, count: int, r_max: float, s_min: float, s_max: float) -> void:
+## Scatter inside a disc, avoiding the pond, cabin, campfire and spawn spots.
+func _scatter_disc(path: String, count: int, r_max: float, s_min: float, s_max: float, base_h: float) -> void:
 	var xforms: Array = []
 	var rng := RandomNumberGenerator.new()
 	rng.seed = hash(path) * 7 + count
@@ -762,15 +838,18 @@ func _scatter_disc(path: String, count: int, r_max: float, s_min: float, s_max: 
 			continue
 		if p.distance_to(Vector3(4.2, 0, -2.2)) < 1.6:
 			continue
+		if p.distance_to(Vector3(0, 0, 10)) < 3.0:
+			continue   # keep the spawn (and the start-screen camera) clear
 		xforms.append(Transform3D(
 			Basis(Vector3.UP, rng.randf() * TAU).scaled(Vector3.ONE * rng.randf_range(s_min, s_max)), p))
 		placed += 1
-	_multimesh_from_glb(path, xforms)
+	_multimesh_from_glb(path, xforms, base_h)
 
 
 ## Build MultiMesh instances for EVERY MeshInstance3D inside the .glb (some models split
 ## trunk/leaves into separate meshes — one MultiMesh per mesh, same instance transforms).
-func _multimesh_from_glb(path: String, xforms: Array) -> void:
+## `base_h` > 0 pre-scales the model so its native height becomes base_h metres.
+func _multimesh_from_glb(path: String, xforms: Array, base_h := 0.0) -> void:
 	if xforms.is_empty() or not ResourceLoader.exists(path):
 		return
 	var packed = load(path)
@@ -779,14 +858,23 @@ func _multimesh_from_glb(path: String, xforms: Array) -> void:
 	var src := (packed as PackedScene).instantiate() as Node3D
 	var parts: Array = []
 	_collect_meshes(src, Transform3D.IDENTITY, parts)
+	var native_h := 0.0
+	for part: Array in parts:
+		var bb: AABB = (part[1] as Transform3D) * ((part[0] as Mesh).get_aabb())
+		native_h = maxf(native_h, bb.end.y)
 	src.free()
+	var norm := 1.0
+	if base_h > 0.0 and native_h > 0.001:
+		norm = base_h / native_h
 	for part: Array in parts:
 		var mm := MultiMesh.new()
 		mm.transform_format = MultiMesh.TRANSFORM_3D
 		mm.mesh = part[0]
 		mm.instance_count = xforms.size()
 		for i in xforms.size():
-			mm.set_instance_transform(i, (xforms[i] as Transform3D) * (part[1] as Transform3D))
+			var xf := (xforms[i] as Transform3D)
+			xf.basis = xf.basis.scaled(Vector3.ONE * norm)
+			mm.set_instance_transform(i, xf * (part[1] as Transform3D))
 		var mmi := MultiMeshInstance3D.new()
 		mmi.multimesh = mm
 		add_child(mmi)
@@ -847,14 +935,23 @@ func _setup_web_time_hooks() -> void:
 	if win != null:
 		win.gogiSetTime = _js_set_time_cb
 	JavaScriptBridge.eval("window.__gogiTime='%s';window.gogiGetTime=function(){return window.__gogiTime;};" % weather.time_state, true)
-	_js_get_player_cb = JavaScriptBridge.create_callback(_on_gogi_get_player)
-	_js_solids_cb = JavaScriptBridge.create_callback(_on_gogi_solids)
-	if win != null:
-		win.__gogiGetPlayerRaw = _js_get_player_cb
-		win.__gogiSolidsRaw = _js_solids_cb
+	# State mirrors: create_callback return values don't propagate to JS callers in this
+	# web build, so player/solids state is PUSHED into plain JS globals instead.
+	JavaScriptBridge.eval("window.__gogiSolids=%s;" % _solids_json(), true)
 	JavaScriptBridge.eval(
-		"window.gogiGetPlayer=function(){var s=window.__gogiGetPlayerRaw();return s?JSON.parse(s):null;};" +
-		"window.gogiSolids=function(){var s=window.__gogiSolidsRaw();return s?JSON.parse(s):[];};", true)
+		"window.gogiGetPlayer=function(){return window.__gogiPlayer||null;};" +
+		"window.gogiSolids=function(){return window.__gogiSolids||[];};", true)
+	_mirror_state_to_js(true)
+
+
+## Push live player state into window.__gogiPlayer a few times a second (web only).
+func _mirror_state_to_js(force := false) -> void:
+	if not OS.has_feature("web"):
+		return
+	_mirror_tick += 1
+	if not force and _mirror_tick % 12 != 0:
+		return
+	JavaScriptBridge.eval("window.__gogiPlayer=%s;" % _player_json(), true)
 
 
 func _on_gogi_set_time(args: Array) -> void:
@@ -866,18 +963,16 @@ func _on_gogi_set_time(args: Array) -> void:
 	print("GOGI_TIME ", weather.time_state)
 
 
-func _on_gogi_get_player(_args: Array) -> String:
+func _player_json() -> String:
 	if player == null or not is_instance_valid(player):
 		return "null"
 	var p := player.global_position
 	return JSON.stringify({"x": p.x, "y": p.y, "z": p.z, "in_vehicle": false, "on_floor": player.is_on_floor(), "chest_found": chest_found})
 
 
-func _on_gogi_solids(_args: Array) -> String:
+func _solids_json() -> String:
 	var out: Array = []
-	var scene := get_tree().current_scene
-	if scene != null:
-		_collect_solids(scene, out)
+	_collect_solids(self, out)
 	return JSON.stringify(out)
 
 
